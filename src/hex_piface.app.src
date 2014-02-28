@@ -1,0 +1,13 @@
+{application, hex_piface,
+ [
+  {description, "hex piface/gpio plugin"},
+  {vsn, "1"},
+  {registered, []},
+  {applications, [
+                  kernel,
+                  stdlib,
+		  piface,
+		  gpio
+                 ]},
+  {mod, { hex_piface_app, []}}
+ ]}.
