@@ -27,16 +27,16 @@
 
 -export([validate_event/2, 
 	 init_event/2,
-	 add_event/2, 
+	 add_event/3, 
 	 del_event/1, 
 	 output/2]).
 
 %%
-%%  add_event(Flags::[{atom(),term()}, Signal::signal()) ->    
+%%  add_event(Flags::[{atom(),term()}, Signal::signal(), Cb::function()) ->    
 %%     {ok, Ref:reference()} | {error, Reason}
 %%
-add_event(Flags, Signal) ->
-    hex_piface_server:add_event(Flags, Signal).
+add_event(Flags, Signal, Cb) ->
+    hex_piface_server:add_event(Flags, Signal, Cb).
 
 %%
 %%  del_event(Ref::reference()) ->

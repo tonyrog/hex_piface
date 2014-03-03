@@ -46,11 +46,20 @@
 
 -type edge_mask_t() :: 0..3.  %% ?EDGE_xxx (union of all subs)
 
+-record(sub,
+	{
+	  ref :: reference(),
+	  edge_mask :: edge_mask_t(),
+	  polarity  :: boolean(),
+	  signal :: term(),
+	  callback :: atom() | function()
+	}).
+
 -record(pinsub,
 	{
 	  pin_key        :: {PinReg::integer(),Pin::integer()},
 	  edge_mask = 0  :: edge_mask_t(),
-	  subs = [] :: [{Ref::reference(),Edge::edge_mask_t(),Signal::term()}]
+	  subs = [] :: [#sub{}]
 	}).
 
 -record(state, {
@@ -118,17 +127,17 @@ init([]) ->
 %% @end
 %%--------------------------------------------------------------------
 handle_call({add_event,Flags,Signal,Cb}, _From, State) ->
-    %% pin_reg = 0..N, pin = 0..N, interrupt=rising|falling|both
     PinReg = proplists:get_value(pin_reg, Flags, 0),
     Pin = proplists:get_value(pin, Flags),
     Edge = proplists:get_value(interrupt, Flags, both),
+    Polarity = proplists:get_value(polarity, Flags, false),
     EdgeMask = case Edge of
 		   falling -> ?EDGE_FALLING;
 		   rising  -> ?EDGE_RISING;
 		   both    -> ?EDGE_BOTH
 	       end,
     Ref = make_ref(),
-    case add_pinsub(Ref, {PinReg,Pin}, EdgeMask, Signal, Cb, State) of
+    case add_pinsub(Ref, {PinReg,Pin}, EdgeMask, Polarity, Signal, Cb, State) of
 	{ok,State1} ->
 	    {reply, {ok,Ref}, State1};
 	Error ->
@@ -188,10 +197,16 @@ handle_info(_Info={gpio_interrupt, 0, ?PIFACE_INTERRUPT_PIN, _Value}, State) ->
 				  end,
 			      %% polarity? on this level? then easy to share.
 			      lists:foreach(
-				fun({_Ref,EdgeMask,Signal,Cb}) ->
+				fun(#sub { edge_mask=EdgeMask,
+					   polarity=Polarity,
+					   signal=Signal,
+					   callback=Cb}) ->
 					if EdgeMask band TriggerMask =/= 0 ->
+						Value1=if Polarity->1-Value;
+							  true -> Value
+						       end,
 						callback(Cb,Signal,
-							 [{value,Value}]);
+							 [{value,Value1}]);
 					   true ->
 						ok
 					end
@@ -242,12 +257,17 @@ callback(Cb,Signal,Env) when is_atom(Cb) ->
 callback(Cb,Signal,Env) when is_function(Cb, 2) ->
     Cb(Signal,Env).
 
-add_pinsub(Ref, Key, EdgeMask, Signal, Cb, State) ->
+add_pinsub(Ref, Key, EdgeMask, Polarity, Signal, Cb, State) ->
     case lists:keytake(Key, #pinsub.pin_key, State#state.pin_list) of
 	false ->
+	    Sub = #sub { ref = Ref,
+			 edge_mask = EdgeMask,
+			 polarity = Polarity,
+			 signal = Signal,
+			 callback = Cb },
 	    PinSub = #pinsub { pin_key   = Key,
 			       edge_mask = EdgeMask,
-			       subs    = [{Ref,EdgeMask,Signal,Cb}]
+			       subs    = [Sub]
 			     },
 	    PinList1 = [PinSub | State#state.pin_list],
 	    RefList1 = [{Ref, Key} | State#state.ref_list],
@@ -255,7 +275,12 @@ add_pinsub(Ref, Key, EdgeMask, Signal, Cb, State) ->
 			      pin_list = PinList1 }};
 	{value,PinSub,PinList} ->
 	    Mask1 = PinSub#pinsub.edge_mask bor EdgeMask,
-	    Subs1 = [{Ref,EdgeMask,Signal,Cb}|PinSub#pinsub.subs],
+	    Sub = #sub { ref = Ref,
+			 edge_mask = EdgeMask,
+			 polarity = Polarity,
+			 signal = Signal,
+			 callback = Cb },
+	    Subs1 = [Sub|PinSub#pinsub.subs],
 	    PinSub1 = PinSub#pinsub { edge_mask = Mask1,
 				      subs      = Subs1 },
 	    PinList1 = [PinSub1 | PinList],
@@ -274,11 +299,11 @@ del_pinsub(Ref, State) ->
 		    %% {error, enoent}; %% strange!
 		    {ok, State#state { ref_list = RefList1 }};
 		{value,PinSub,PinList} ->
-		    case lists:keytake(Ref, 1, PinSub#pinsub.subs) of
+		    case lists:keytake(Ref, #sub.ref, PinSub#pinsub.subs) of
 			false ->
 			    %% {error, enoent}; %% strange!
 			    {ok, State#state { ref_list = RefList1 }};
-			{value,{_Ref,_Edge,_Signal,_Cb},Subs1} ->
+			{value,#sub{},Subs1} ->
 			    %% re calculate the pin mask
 			    Mask1 = lists:foldl(fun({_,M,_}, M0) ->
 							M bor M0
