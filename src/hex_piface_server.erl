@@ -32,7 +32,7 @@
 
 %% API
 -export([start_link/0, stop/0]).
--export([add_event/2, del_event/1]).
+-export([add_event/3, del_event/1]).
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
 	 terminate/2, code_change/3]).
@@ -62,8 +62,9 @@
 %%%===================================================================
 %%% API
 %%%===================================================================
-add_event(Flags, Signal) ->
-    gen_server:call(?MODULE, {add_event, Flags, Signal}).
+
+add_event(Flags, Signal, Cb) when is_atom(Cb); is_function(Cb,2) ->
+    gen_server:call(?MODULE, {add_event, Flags, Signal, Cb}).
 
 del_event(Ref) ->
     gen_server:call(?MODULE, {del_event, Ref}).
@@ -116,7 +117,7 @@ init([]) ->
 %%                                   {stop, Reason, State}
 %% @end
 %%--------------------------------------------------------------------
-handle_call({add_event,Flags,Signal}, _From, State) ->
+handle_call({add_event,Flags,Signal,Cb}, _From, State) ->
     %% pin_reg = 0..N, pin = 0..N, interrupt=rising|falling|both
     PinReg = proplists:get_value(pin_reg, Flags, 0),
     Pin = proplists:get_value(pin, Flags),
@@ -127,7 +128,7 @@ handle_call({add_event,Flags,Signal}, _From, State) ->
 		   both    -> ?EDGE_BOTH
 	       end,
     Ref = make_ref(),
-    case add_pinsub(Ref, {PinReg,Pin}, EdgeMask, Signal, State) of
+    case add_pinsub(Ref, {PinReg,Pin}, EdgeMask, Signal, Cb, State) of
 	{ok,State1} ->
 	    {reply, {ok,Ref}, State1};
 	Error ->
@@ -187,9 +188,10 @@ handle_info(_Info={gpio_interrupt, 0, ?PIFACE_INTERRUPT_PIN, _Value}, State) ->
 				  end,
 			      %% polarity? on this level? then easy to share.
 			      lists:foreach(
-				fun({_Ref,EdgeMask,Signal}) ->
+				fun({_Ref,EdgeMask,Signal,Cb}) ->
 					if EdgeMask band TriggerMask =/= 0 ->
-						hex_server:event(Signal,[{value,Value}]);
+						callback(Cb,Signal,
+							 [{value,Value}]);
 					   true ->
 						ok
 					end
@@ -235,12 +237,17 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
-add_pinsub(Ref, Key, EdgeMask, Signal, State) ->
+callback(Cb,Signal,Env) when is_atom(Cb) ->
+    Cb:event(Signal, Env);
+callback(Cb,Signal,Env) when is_function(Cb, 2) ->
+    Cb(Signal,Env).
+
+add_pinsub(Ref, Key, EdgeMask, Signal, Cb, State) ->
     case lists:keytake(Key, #pinsub.pin_key, State#state.pin_list) of
 	false ->
 	    PinSub = #pinsub { pin_key   = Key,
 			       edge_mask = EdgeMask,
-			       subs    = [{Ref,EdgeMask,Signal}]
+			       subs    = [{Ref,EdgeMask,Signal,Cb}]
 			     },
 	    PinList1 = [PinSub | State#state.pin_list],
 	    RefList1 = [{Ref, Key} | State#state.ref_list],
@@ -248,7 +255,7 @@ add_pinsub(Ref, Key, EdgeMask, Signal, State) ->
 			      pin_list = PinList1 }};
 	{value,PinSub,PinList} ->
 	    Mask1 = PinSub#pinsub.edge_mask bor EdgeMask,
-	    Subs1 = [{Ref,EdgeMask,Signal}|PinSub#pinsub.subs],
+	    Subs1 = [{Ref,EdgeMask,Signal,Cb}|PinSub#pinsub.subs],
 	    PinSub1 = PinSub#pinsub { edge_mask = Mask1,
 				      subs      = Subs1 },
 	    PinList1 = [PinSub1 | PinList],
@@ -271,7 +278,7 @@ del_pinsub(Ref, State) ->
 			false ->
 			    %% {error, enoent}; %% strange!
 			    {ok, State#state { ref_list = RefList1 }};
-			{value,{_Ref,_Edge,_Signal},Subs1} ->
+			{value,{_Ref,_Edge,_Signal,_Cb},Subs1} ->
 			    %% re calculate the pin mask
 			    Mask1 = lists:foldl(fun({_,M,_}, M0) ->
 							M bor M0
