@@ -63,6 +63,7 @@
 	}).
 
 -record(state, {
+	  joined = false  :: boolean(),
 	  pinmask = 0 :: integer,  %% old interrupt mask
 	  pin_list = [] :: [#pinsub{}],
 	  ref_list = [] :: [{Ref::reference(),{PinReg::integer,Pin::integer()}}]
@@ -73,7 +74,7 @@
 %%%===================================================================
 
 add_event(Flags, Signal, Cb) when is_atom(Cb); is_function(Cb,2) ->
-    gen_server:call(?MODULE, {add_event, Flags, Signal, Cb}).
+    gen_server:call(?MODULE, {add_event, self(), Flags, Signal, Cb}).
 
 del_event(Ref) ->
     gen_server:call(?MODULE, {del_event, Ref}).
@@ -110,7 +111,8 @@ init([]) ->
     piface:init_interrupt(),
     gpio:init(?PIFACE_INTERRUPT_PIN),
     gpio:set_interrupt(?PIFACE_INTERRUPT_PIN, falling),
-    {ok, #state{}}.
+    Joined = hex:auto_join(hex_piface),
+    {ok, #state{joined = Joined}}.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -126,7 +128,7 @@ init([]) ->
 %%                                   {stop, Reason, State}
 %% @end
 %%--------------------------------------------------------------------
-handle_call({add_event,Flags,Signal,Cb}, _From, State) ->
+handle_call({add_event,Pid,Flags,Signal,Cb}, _From, State) ->
     PinReg = proplists:get_value(pin_reg, Flags, 0),
     Pin = proplists:get_value(pin, Flags),
     Edge = proplists:get_value(interrupt, Flags, both),
@@ -136,8 +138,8 @@ handle_call({add_event,Flags,Signal,Cb}, _From, State) ->
 		   rising  -> ?EDGE_RISING;
 		   both    -> ?EDGE_BOTH
 	       end,
-    Ref = make_ref(),
-    case add_pinsub(Ref, {PinReg,Pin}, EdgeMask, Polarity, Signal, Cb, State) of
+    Ref = erlang:monitor(process, Pid),
+    case add_pinsub(Ref,{PinReg,Pin},EdgeMask,Polarity,Signal,Cb,State) of
 	{ok,State1} ->
 	    {reply, {ok,Ref}, State1};
 	Error ->
@@ -219,8 +221,16 @@ handle_info(_Info={gpio_interrupt, 0, ?PIFACE_INTERRUPT_PIN, _Value}, State) ->
 	    lager:warning("piface interrupt but no pins changed ~p", [PinMask]),
 	    {noreply, State}
     end;
+handle_info({'DOWN',Ref,process,_Pid,_Reason}, State) ->
+    lager:debug("monitor DOWN ~p ~p", [_Pid,_Reason]),
+    case del_pinsub(Ref, State) of
+	{ok, State1} ->
+	    {noeply,State1};
+	_Error ->
+	    {noreply,State}
+    end;
 handle_info(_Info, State) ->
-    lager:debug("info ~p\n", [_Info]),
+    lager:debug("unhandled info ~p", [_Info]),
     {noreply, State}.
 
 %%--------------------------------------------------------------------
@@ -257,7 +267,7 @@ callback(Cb,Signal,Env) when is_atom(Cb) ->
 callback(Cb,Signal,Env) when is_function(Cb, 2) ->
     Cb(Signal,Env).
 
-add_pinsub(Ref, Key, EdgeMask, Polarity, Signal, Cb, State) ->
+add_pinsub(Ref,Key,EdgeMask,Polarity,Signal,Cb,State) ->
     case lists:keytake(Key, #pinsub.pin_key, State#state.pin_list) of
 	false ->
 	    Sub = #sub { ref = Ref,
