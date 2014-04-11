@@ -26,7 +26,9 @@
 -behaviour(hex_plugin).
 
 -export([validate_event/2, 
+	 event_spec/1,
 	 init_event/2,
+	 mod_event/2,
 	 add_event/3, 
 	 del_event/1, 
 	 output/2]).
@@ -90,32 +92,43 @@ init_event(out,Flags) ->
 	true -> piface:gpio_set(Pin)
     end.
 
+mod_event(in, _Flags) ->
+    ok;
+mod_event(out, Flags) ->
+    %% fixme: send to hex_piface_server
+    init_event(out, Flags).
+
 %%
 %% validate_event(in | out, Flags::[{atom(),term()}]) -> ok | {error,Error}
 %%
-validate_event(in, Flags) ->
-    hex:validate_flags(Flags, input_spec());
-validate_event(out, Flags) ->
-    hex:validate_flags(Flags, output_spec()).
+validate_event(Dir, Flags) ->
+    hex:validate_flags(Flags, event_spec(Dir)).
 
-output_spec() ->
-    [{pin, mandatory, {integer,0,7}, undefined},
-     {pin_reg, optional, {integer,0,1}, 0},
-     {value, optional, {alt,[boolean,unsigned1]}, undefined},
-     {init_value, optional, {alt,[{const,high},
-				  {const,low},
-				  {const,out}]}, out},
-     {polarity, optional, boolean, false},
-     {direct, optional, boolean, false}
-    ].
-
-input_spec() ->
-   [ {pin, mandatory, {integer,0,7}, undefined},
-     {pin_reg, optional, {integer,0,1}, 0},
-     {interrupt, optional, {alt,[{const,none},
-				 {const,rising},
-				 {const,falling},
-				 {const,both}]}, none},
-     {polarity, optional, boolean, false},
-     {direct, optional, boolean, false}
+event_spec(out) ->
+    [{leaf,pin,[{type,uint8,[{range,[{0,7}],[]}]},{mandatory,true,[]}]},
+     {leaf,pin_reg,[{type,uint8,[{range,[{0,1}],[]}]},{default,0,[]}]},
+     {leaf,value,[{type,uint8,[{range,[{0,1}],[]}]}]}, %% boolean?
+     {leaf,init_value,[{type,enumeration,
+			[{enum,high,[]},
+			 {enum,low,[]},
+			 {enum,out,[]}]},
+		       {default, out, []}]},
+     {leaf,polarity,[{type,boolean,[]},
+		     {default,false,[]}]},
+     {leaf,direct,[{type,boolean,[]},
+		   {default,false,[]}]}
+    ];
+event_spec(in) ->
+    [{leaf,pin,[{type,uint8,[{range,[{0,7}],[]}]},{mandatory,true,[]}]},
+     {leaf,pin_reg,[{type,uint8,[{range,[{0,1}],[]}]},{default,0,[]}]},
+     {leaf,interrupt,[{type,enumeration,
+		      [{enum,none,[]},
+		       {enum,rising,[]},
+		       {enum,falling,[]},
+		       {enum,both,[]}]},
+		      {default,none,[]}]},
+     {leaf,polarity,[{type,boolean,[]},
+		     {default,false,[]}]},
+     {leaf,direct,[{type,boolean,[]},
+		   {default,false,[]}]}
     ].
