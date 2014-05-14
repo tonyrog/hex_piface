@@ -183,15 +183,18 @@ handle_cast(_Msg, State) ->
 %% @end
 %%--------------------------------------------------------------------
 handle_info(_Info={gpio_interrupt, 0, ?PIFACE_INTERRUPT_PIN, _Value}, State) ->
-    lager:debug("gpio event for piface ~p", [_Info]),
     PinMask = piface:read_input(), %% will clear the interrupt as wll
+    lager:debug("gpio event for piface ~p, pinmask=0x~.16B", [_Info,PinMask]),
     if PinMask =/= State#state.pinmask ->
 	    ChangedPins = PinMask bxor State#state.pinmask,
 	    lists:foreach(
 	      fun(Pin) when (1 bsl Pin) band ChangedPins =/= 0 ->
 		      Value = (PinMask bsr Pin) band 1, %% new value
-		      case lists:keyfind(Pin, #pinsub.pin_key, State#state.pin_list) of
-			  false -> ignore;  %% no one listen
+		      PinReg = 0,  %% the only reg for input right now!
+		      Key = {PinReg,Pin},
+		      case lists:keyfind(Key, #pinsub.pin_key, State#state.pin_list) of
+			  false -> 
+			      ignore;  %% no one listen
 			  PinSub ->
 			      TriggerMask = 
 				  if Value =:= 0 -> ?EDGE_FALLING;
