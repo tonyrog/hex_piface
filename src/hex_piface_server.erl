@@ -25,7 +25,6 @@
 
 -behaviour(gen_server).
 
--include_lib("lager/include/log.hrl").
 -include_lib("hex/include/hex.hrl").
 
 -define(PIFACE_INTERRUPT_PIN,  25).
