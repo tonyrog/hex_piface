@@ -51,6 +51,9 @@
 	  ref :: reference(),
 	  edge_mask :: edge_mask_t(),
 	  polarity  :: boolean(),
+	  debounce = 0 :: non_neg_integer(),
+	  debounce_timer :: undefined | reference(),
+	  debounce_value :: undefined | 0 | 1,
 	  signal :: term(),
 	  callback :: atom() | function()
 	}).
@@ -133,13 +136,20 @@ handle_call({add_event,Pid,Flags,Signal,Cb}, _From, State) ->
     Pin = proplists:get_value(pin, Flags),
     Edge = proplists:get_value(interrupt, Flags, both),
     Polarity = proplists:get_value(polarity, Flags, false),
+    Debounce = proplists:get_value(debounce, Flags, 0),
     EdgeMask = case Edge of
 		   falling -> ?EDGE_FALLING;
 		   rising  -> ?EDGE_RISING;
 		   both    -> ?EDGE_BOTH
 	       end,
     Ref = erlang:monitor(process, Pid),
-    case add_pinsub(Ref,{PinReg,Pin},EdgeMask,Polarity,Signal,Cb,State) of
+    Sub = #sub { ref = Ref,
+		 edge_mask = EdgeMask,
+		 polarity  = Polarity,
+		 debounce = Debounce,
+		 signal = Signal,
+		 callback = Cb },
+    case add_pinsub(Ref,{PinReg,Pin},Sub,State) of
 	{ok,State1} ->
 	    {reply, {ok,Ref}, State1};
 	Error ->
@@ -187,42 +197,20 @@ handle_info(_Info={gpio_interrupt, 0, ?PIFACE_INTERRUPT_PIN, _Value}, State) ->
     lager:debug("gpio event for piface ~p, pinmask=0x~.16B", [_Info,PinMask]),
     if PinMask =/= State#state.pinmask ->
 	    ChangedPins = PinMask bxor State#state.pinmask,
-	    lists:foreach(
-	      fun(Pin) when (1 bsl Pin) band ChangedPins =/= 0 ->
-		      Value = (PinMask bsr Pin) band 1, %% new value
-		      PinReg = 0,  %% the only reg for input right now!
-		      Key = {PinReg,Pin},
-		      case lists:keyfind(Key, #pinsub.pin_key, State#state.pin_list) of
-			  false -> 
-			      ignore;  %% no one listen
-			  PinSub ->
-			      TriggerMask = 
-				  if Value =:= 0 -> ?EDGE_FALLING;
-				     true -> ?EDGE_RISING
-				  end,
-			      %% polarity? on this level? then easy to share.
-			      lists:foreach(
-				fun(#sub { edge_mask=EdgeMask,
-					   polarity=Polarity,
-					   signal=Signal,
-					   callback=Cb}) ->
-					if EdgeMask band TriggerMask =/= 0 ->
-						Value1=if Polarity->1-Value;
-							  true -> Value
-						       end,
-						callback(Cb,Signal,
-							 [{value,Value1}]);
-					   true ->
-						ok
-					end
-				end, PinSub#pinsub.subs)
-		      end;
-		 (_) -> ignore %% pin has not changed
-	      end, lists:seq(0, 7)),
-	    {noreply, State#state { pinmask = PinMask }};
+	    PinList = run_pin_list(State#state.pin_list, ChangedPins, PinMask),
+	    {noreply, State#state { pin_list = PinList, pinmask = PinMask }};
        true ->  %% no pins changed since last changed (strange?)
 	    lager:warning("piface interrupt but no pins changed ~p", [PinMask]),
 	    {noreply, State}
+    end;
+handle_info({timeout, Timer, {debounce,Key}}, State) ->
+    case lists:keytake(Key, #pinsub.pin_key, State#state.pin_list) of
+	false ->
+	    {noreply, State};
+	{value,PinSub,PinList} ->
+	    Subs = run_debounce(PinSub#pinsub.subs, Timer),
+	    PinSub1 = PinSub#pinsub { subs = Subs },
+	    {noreply, State#state { pin_list = [PinSub1 | PinList]}}
     end;
 handle_info({'DOWN',Ref,process,_Pid,_Reason}, State) ->
     lager:debug("monitor DOWN ~p ~p", [_Pid,_Reason]),
@@ -270,16 +258,11 @@ callback(Cb,Signal,Env) when is_atom(Cb) ->
 callback(Cb,Signal,Env) when is_function(Cb, 2) ->
     Cb(Signal,Env).
 
-add_pinsub(Ref,Key,EdgeMask,Polarity,Signal,Cb,State) ->
+add_pinsub(Ref,Key,Sub,State) ->
     case lists:keytake(Key, #pinsub.pin_key, State#state.pin_list) of
 	false ->
-	    Sub = #sub { ref = Ref,
-			 edge_mask = EdgeMask,
-			 polarity = Polarity,
-			 signal = Signal,
-			 callback = Cb },
 	    PinSub = #pinsub { pin_key   = Key,
-			       edge_mask = EdgeMask,
+			       edge_mask = Sub#sub.edge_mask,
 			       subs    = [Sub]
 			     },
 	    PinList1 = [PinSub | State#state.pin_list],
@@ -287,12 +270,7 @@ add_pinsub(Ref,Key,EdgeMask,Polarity,Signal,Cb,State) ->
 	    {ok,State#state { ref_list = RefList1,
 			      pin_list = PinList1 }};
 	{value,PinSub,PinList} ->
-	    Mask1 = PinSub#pinsub.edge_mask bor EdgeMask,
-	    Sub = #sub { ref = Ref,
-			 edge_mask = EdgeMask,
-			 polarity = Polarity,
-			 signal = Signal,
-			 callback = Cb },
+	    Mask1 = PinSub#pinsub.edge_mask bor Sub#sub.edge_mask,
 	    Subs1 = [Sub|PinSub#pinsub.subs],
 	    PinSub1 = PinSub#pinsub { edge_mask = Mask1,
 				      subs      = Subs1 },
@@ -329,3 +307,74 @@ del_pinsub(Ref, State) ->
 		    end
 	    end
     end.
+
+run_pin_list([PinSub = #pinsub { pin_key=Key={_PinReg,Pin},subs=Subs } |
+	      PinList], ChangedPins, PinMask)
+  when (1 bsl Pin) band ChangedPins =/= 0 ->
+    Value = (PinMask bsr Pin) band 1, %% new value
+    Mask = if Value =:= 0 -> ?EDGE_FALLING;
+	      true -> ?EDGE_RISING
+	   end,
+    Subs1 = run_pinsub(Subs, Key, Mask, Value),
+    [PinSub#pinsub { subs=Subs1 } | run_pin_list(PinList,ChangedPins,PinMask)];
+run_pin_list([PinSub | PinList], ChangedPins, PinMask) ->
+    [PinSub | run_pin_list(PinList,ChangedPins,PinMask)];
+run_pin_list([], _ChangedPins, _PinMask) ->
+    [].
+    
+%% no debounce used
+run_pinsub([Sub=#sub {edge_mask=EdgeMask,
+		      polarity=Polarity,
+		      debounce=0,
+		      signal=Signal,
+		      callback=Cb} | Subs], Key, Mask, Value) ->
+    if EdgeMask band Mask =/= 0 ->
+	    callback(Cb,Signal,[{value,polarity(Polarity,Value)}]);
+       true ->
+	    ok
+    end,
+    [Sub | run_pinsub(Subs, Key, Mask, Value)];
+%% debounce timer not started
+run_pinsub([Sub=#sub {edge_mask=EdgeMask,
+		      debounce=Debounce,
+		      debounce_timer=undefined
+		     } | Subs], Key, Mask, Value) ->
+    if EdgeMask band Mask =/= 0 ->
+	    Timer = start_debounce_timer(Debounce, Key),
+	    [ Sub#sub { debounce_timer=Timer, debounce_value=Value } |
+	      run_pinsub(Subs, Key, Mask, Value)];
+       true ->
+	    [ Sub | run_pinsub(Subs, Key, Mask, Value)]
+    end;
+%% debounce timer is running
+run_pinsub([Sub|Subs], Key, Mask, Value) ->
+    [ Sub#sub { debounce_value=Value } | run_pinsub(Subs, Key, Mask, Value)];
+run_pinsub([], _Key, _Mask, _Value) ->
+    [].
+
+%% Debounce timer is done send the latest value if it match edge_mask
+run_debounce([Sub=#sub {edge_mask=EdgeMask,
+			polarity=Polarity,
+			debounce_timer=Timer,
+			debounce_value=Value,
+			signal=Signal,
+			callback=Cb} | Subs], Timer) ->
+    if Value =:= 0, (EdgeMask band ?EDGE_FALLING) =/= 0;
+       Value =:= 1, (EdgeMask band ?EDGE_RISING) =/= 0 ->
+	    callback(Cb,Signal,[{value,polarity(Polarity,Value)}]);
+       true ->
+	    ok
+    end,
+    [Sub#sub { debounce_timer=undefined,debounce_value=undefined} | Subs];
+run_debounce([Sub|Subs], Timer) ->
+    [Sub|run_debounce(Subs,Timer)];
+run_debounce([], _Timer) ->
+    [].
+
+polarity(false,Value) -> Value;
+polarity(true,Value) -> 1-Value.
+
+start_debounce_timer(0,_Key) ->
+    undefined;
+start_debounce_timer(Time,Key) ->
+    erlang:start_timer(Time, self(), {debounce,Key}).
